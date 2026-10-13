@@ -202,6 +202,11 @@ type Client struct {
 	SuccessfulTransfer        bool
 
 	// send / receive information of all files
+	//
+	// progressMu guards these, the current-file counters below and
+	// FilesHasFinished. It is a leaf lock: no other lock is ever taken while it
+	// is held, so callers may hold receiveMutex or c.mutex when entering it.
+	progressMu                sync.RWMutex
 	FilesToTransfer           []FileInfo
 	EmptyFoldersToTransfer    []FileInfo
 	TotalNumberOfContents     int
@@ -780,8 +785,7 @@ func (c *Client) resetForReconnectAttempt(attempt int) error {
 	c.tailcat.terminal.Store(false)
 	c.CurrentFileChunkRanges = nil
 	c.CurrentFileChunkCount = 0
-	c.TotalSent = 0
-	c.TotalChunksTransferred = 0
+	c.resetTransferCounters()
 	c.numfinished = 0
 	if !c.Options.IsSender {
 		pakeInstance, err := pakekey.Init(
@@ -1285,7 +1289,7 @@ func exactPathExcluded(exclusions []string, candidate string) bool {
 }
 
 func (c *Client) sendCollectFiles(filesInfo []FileInfo) (err error) {
-	c.FilesToTransfer = filesInfo
+	c.setFilesToTransfer(filesInfo)
 	c.sourceSnapshots = make([]os.FileInfo, len(filesInfo))
 	totalFilesSize := int64(0)
 	requestedAlgorithm := c.Options.HashAlgorithm
@@ -1785,7 +1789,7 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 	c.EmptyFoldersToTransfer = emptyFoldersToTransfer
 	c.TotalNumberFolders = totalNumberFolders
 	c.TotalNumberOfContents = len(filesInfo)
-	c.FilesToTransfer = filesInfo
+	c.setFilesToTransfer(filesInfo)
 	c.tailcat.transferBytes.Store(totalLogicalTransferSize(filesInfo))
 	c.startTailcatPreparation()
 	hashResult := make(chan error, 1)
@@ -3010,7 +3014,7 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 		if c.peerInlineMetadata {
 			c.ExternalIPConnected = preferredPeerIP(c.ExternalIPConnected, remoteFile.ExternalIP)
 		}
-		c.FilesToTransferCurrentNum = remoteFile.FilesToTransferCurrentNum
+		c.setCurrentFileNum(remoteFile.FilesToTransferCurrentNum)
 		c.CurrentFileChunkRanges = remoteFile.CurrentFileChunkRanges
 		c.CurrentFileChunkCount = utils.ChunkRangesCount(
 			c.CurrentFileChunkRanges,
@@ -3205,7 +3209,7 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 		}
 		c.updateLifecycle(func(state *transferLifecycle) { state.Successful = true })
 		c.tailcat.terminal.Store(true)
-		c.FilesHasFinished[c.FilesToTransferCurrentNum] = struct{}{}
+		c.markFileFinished()
 		return
 	}
 
@@ -3215,8 +3219,7 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 	}
 
 	c.receiveMutex.Lock()
-	c.TotalSent = 0
-	c.TotalChunksTransferred = 0
+	c.resetTransferCounters()
 	c.CurrentFileIsClosed = false
 	c.receiveMutex.Unlock()
 	machID, _ := machineid.ID()
@@ -3396,7 +3399,7 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 		return err
 	}
 	for i, fileInfo := range c.FilesToTransfer {
-		if _, ok := c.FilesHasFinished[i]; ok {
+		if c.hasFileFinished(i) {
 			continue
 		}
 		if i < c.FilesToTransferCurrentNum || fileInfo.declined {
@@ -3489,7 +3492,7 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 		}
 		if !hashesEqual {
 			finished = false
-			c.FilesToTransferCurrentNum = i
+			c.setCurrentFileNum(i)
 			c.numberOfTransferredFiles++
 			newFolder, _ := filepath.Split(fileInfo.FolderRemote)
 			if newFolder != c.LastFolder && len(c.FilesToTransfer) > 0 && !c.Options.SendingText && newFolder != "./" {
@@ -3552,7 +3555,7 @@ func (c *Client) updateState(attempt *transferAttemptState) (err error) {
 		c.markTransferStarted()
 		// setup the progressbar
 		c.setBar()
-		c.TotalSent = 0
+		c.setTotalSent(0)
 		c.CurrentFileIsClosed = false
 		log.Debug("beginning sending comms")
 		pathToFile := path.Join(
@@ -3703,10 +3706,7 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 			c.receiveMutex.Unlock()
 			return
 		}
-		c.TotalSent += int64(len(data[8:]))
-		c.TotalChunksTransferred++
-		finished := c.TotalChunksTransferred == c.CurrentFileChunkCount ||
-			c.TotalSent == c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
+		finished := c.recordReceivedChunk(int64(len(data[8:])), c.CurrentFileChunkCount)
 		if finished {
 			c.CurrentFileIsClosed = true
 		}
@@ -3844,7 +3844,7 @@ func (c *Client) sendData(i int, dataConn *comm.Comm, fread *os.File, queue *req
 			}
 			c.addProgress(int64(n))
 			c.mutex.Lock()
-			c.TotalSent += int64(n)
+			c.addTotalSent(int64(n))
 			c.mutex.Unlock()
 			queue.complete()
 		}
