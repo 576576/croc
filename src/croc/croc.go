@@ -129,6 +129,11 @@ type Options struct {
 	DisableClipboard  bool
 	ExtendedClipboard bool
 	Transport         TransportMode `json:",omitempty"`
+
+	// LibraryMode swaps the paths that would panic or exit the process for
+	// returned errors, so a host that links croc as a shared library can
+	// report the failure instead of dying with it. The CLI leaves it off.
+	LibraryMode bool
 }
 
 // TransportMode controls how a sender selects the file-data connection after
@@ -458,6 +463,9 @@ func newClient(ops Options, transport tailcatDataTransport) (c *Client, err erro
 		var uploadLimit int64
 		uploadLimit, err = strconv.ParseInt(upload, 10, 64)
 		if err != nil {
+			if c.Options.LibraryMode {
+				return nil, errors.New("could not parse given upload limit")
+			}
 			panic("Could not parse given Upload Limit")
 		}
 		minBurstSize := models.TCP_BUFFER_SIZE
@@ -472,6 +480,9 @@ func newClient(ops Options, transport tailcatDataTransport) (c *Client, err erro
 		default:
 			uploadLimit, err = strconv.ParseInt(c.Options.ThrottleUpload, 10, 64)
 			if err != nil {
+				if c.Options.LibraryMode {
+					return nil, errors.New("could not parse given upload limit")
+				}
 				panic("Could not parse given Upload Limit")
 			}
 		}
@@ -1402,11 +1413,14 @@ func (c *Client) currentFileUsesCompression() bool {
 		c.FilesToTransfer[c.FilesToTransferCurrentNum].IsCompressed
 }
 
-func (c *Client) setupLocalRelay() {
+func (c *Client) setupLocalRelay(errchan chan error) error {
 	// setup the relay locally
 	firstPort, _ := strconv.Atoi(c.Options.RelayPorts[0])
 	openPorts := utils.FindOpenPorts("127.0.0.1", firstPort, len(c.Options.RelayPorts))
 	if len(openPorts) < len(c.Options.RelayPorts) {
+		if c.Options.LibraryMode {
+			return errors.New("not enough open ports to run local relay")
+		}
 		panic("not enough open ports to run local relay")
 	}
 	for i, port := range openPorts {
@@ -1430,10 +1444,21 @@ func (c *Client) setupLocalRelay() {
 				c.Options.RelayPassword,
 				localRelayBanner)
 			if err != nil {
+				if c.Options.LibraryMode {
+					// A local relay that failed to start is not fatal (the
+					// public relay can still carry the transfer), so report
+					// it instead of killing the host process.
+					select {
+					case errchan <- err:
+					default:
+					}
+					return
+				}
 				panic(err)
 			}
 		}(port)
 	}
+	return nil
 }
 
 func (c *Client) broadcastOnLocalNetwork(useipv6 bool) {
@@ -1837,7 +1862,9 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 	if !c.Options.DisableLocal {
 		// add two things to the error channel
 		errchan = make(chan error, 2)
-		c.setupLocalRelay()
+		if err = c.setupLocalRelay(errchan); err != nil {
+			return err
+		}
 		// broadcast on ipv4
 		go c.broadcastOnLocalNetwork(false)
 		// broadcast on ipv6
