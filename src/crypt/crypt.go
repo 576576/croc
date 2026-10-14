@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
-	"log"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -23,8 +22,8 @@ func New(passphrase []byte, usersalt []byte) (key []byte, salt []byte, err error
 		salt = make([]byte, 8)
 		// http://www.ietf.org/rfc/rfc2898.txt
 		// Salt.
-		if _, err := rand.Read(salt); err != nil {
-			log.Fatalf("can't get random salt: %v", err)
+		if _, err = rand.Read(salt); err != nil {
+			return
 		}
 	} else {
 		salt = usersalt
@@ -122,7 +121,7 @@ func NewArgon2(passphrase []byte, usersalt []byte) (aead cipher.AEAD, salt []byt
 		// http://www.ietf.org/rfc/rfc2898.txt
 		// Salt.
 		if _, err = rand.Read(salt); err != nil {
-			log.Fatalf("can't get random salt: %v", err)
+			return
 		}
 	} else {
 		salt = usersalt
