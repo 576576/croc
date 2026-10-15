@@ -381,7 +381,16 @@ const (
 	implicitTailcatReadyFeature = "implicit-tailcat-ready-v1"
 	selectedTransportUnset      = 0
 	selectedTransportRelay      = 2
-	localProbeResponseTimeout   = 500 * time.Millisecond
+	// localProbeResponseTimeout bounds the wait for a probe reply while the
+	// peer is already present.
+	localProbeResponseTimeout = 5 * time.Second
+	// localProbePeerJoinTimeout bounds the wait for the answer to the first
+	// probe frame. The peer only answers once its own relay route is up,
+	// which happens after it has started its local relay and dialled the
+	// public relay, so a receiver routinely probes before the sender can
+	// reply. Aborting the probe while that answer is still in flight leaves
+	// the answer behind on the control connection.
+	localProbePeerJoinTimeout = 20 * time.Second
 	// Keep in sync with web/src/protocol/types.ts maxTextTransferBytes.
 	maxTextTransferBytes = 1 << 20
 )
@@ -1687,7 +1696,11 @@ func (c *Client) senderWaitForHandshake(conn *comm.Comm) error {
 // exchange is waiting for its next application frame. A keepalive may be
 // queued immediately after room admission, before the peer's PAKE response.
 func receiveControlFrame(conn *comm.Comm) ([]byte, error) {
-	deadline := time.Now().Add(localProbeResponseTimeout)
+	return receiveControlFrameWithin(conn, localProbeResponseTimeout)
+}
+
+func receiveControlFrameWithin(conn *comm.Comm, timeout time.Duration) ([]byte, error) {
+	deadline := time.Now().Add(timeout)
 	for {
 		data, err := conn.ReceiveWithDeadline(deadline)
 		if err != nil {
@@ -2124,7 +2137,7 @@ func (c *Client) Receive() (err error) {
 				log.Errorf("dataMessage send error: %v", err)
 				return
 			}
-			data, err = receiveControlFrame(c.connection(0))
+			data, err = receiveControlFrameWithin(c.connection(0), localProbePeerJoinTimeout)
 			if err != nil {
 				return
 			}
@@ -2187,6 +2200,14 @@ func (c *Client) Receive() (err error) {
 			}
 			return
 		}()
+
+		if err != nil {
+			// Best-effort: the LAN shortcut is optional, so a probe that gave up
+			// only costs the direct connection. It is still worth reporting,
+			// because whatever the peer sends back can no longer be consumed by
+			// this exchange.
+			log.Debugf("local probe gave up: %v", err)
+		}
 
 		if len(ips) > 1 {
 			port := ips[0]
@@ -2966,6 +2987,16 @@ func (c *Client) processExternalIP(m message.Message) (done bool, err error) {
 func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (done bool, err error) {
 	m, err := message.Decode(c.Key, payload)
 	if err != nil {
+		// A local-IP probe speaks plain JSON over this same connection, and it is
+		// best-effort: if it gives up before the peer's answer arrives, that
+		// answer is still in flight and turns up here. Message frames are always
+		// deflate-compressed, so a payload that parses as a probe frame is not
+		// one, and skipping it keeps the transfer alive.
+		var probe SimpleMessage
+		if json.Unmarshal(payload, &probe) == nil && (probe.Kind == "pake1" || probe.Kind == "pake2") {
+			log.Debugf("skipping local-probe frame in the message stream (%d bytes, kind=%s)", len(payload), probe.Kind)
+			return false, nil
+		}
 		err = fmt.Errorf("problem with decoding: %w", err)
 		log.Debug(err)
 		return
